@@ -1,0 +1,517 @@
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package hosts
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	golog "log"
+	"net"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/coredns/coredns/plugin"
+)
+
+func testHostsfile(file string) *Hostsfile {
+	h := &Hostsfile{
+		Origins: []string{"."},
+		hmap:    newMap(),
+		inline:  newMap(),
+		options: newOptions(),
+	}
+	h.hmap = h.parse(strings.NewReader(file))
+	return h
+}
+
+type staticHostEntry struct {
+	in string
+	v4 []string
+	v6 []string
+}
+
+var (
+	hosts = `255.255.255.255	broadcasthost
+	127.0.0.2	odin
+	127.0.0.3	odin  # inline comment
+	::2             odin
+	127.1.1.1	thor
+	# aliases
+	127.1.1.2	ullr ullrhost
+	fe80::1%lo0	localhost
+	# Bogus entries that must be ignored.
+	123.123.123	loki
+	321.321.321.321`
+	singlelinehosts = `127.0.0.2  odin`
+	ipv4hosts       = `# See https://tools.ietf.org/html/rfc1123.
+	#
+
+	# internet address and host name
+	127.0.0.1	localhost	# inline comment separated by tab
+	127.0.0.2	localhost       # inline comment separated by space
+
+	# internet address, host name and aliases
+	127.0.0.3	localhost	localhost.localdomain`
+	ipv6hosts = `# See https://tools.ietf.org/html/rfc5952, https://tools.ietf.org/html/rfc4007.
+
+	# internet address and host name
+	::1						localhost	# inline comment separated by tab
+	fe80:0000:0000:0000:0000:0000:0000:0001		localhost       # inline comment separated by space
+
+	# internet address with zone identifier and host name
+	fe80:0000:0000:0000:0000:0000:0000:0002%lo0	localhost
+
+	# internet address, host name and aliases
+	fe80::3%lo0					localhost	localhost.localdomain`
+	casehosts = `127.0.0.1	PreserveMe	PreserveMe.local
+		::1		PreserveMe	PreserveMe.local`
+)
+
+var lookupStaticHostTests = []struct {
+	file string
+	ents []staticHostEntry
+}{
+	{
+		hosts,
+		[]staticHostEntry{
+			{"odin.", []string{"127.0.0.2", "127.0.0.3"}, []string{"::2"}},
+			{"thor.", []string{"127.1.1.1"}, []string{}},
+			{"ullr.", []string{"127.1.1.2"}, []string{}},
+			{"ullrhost.", []string{"127.1.1.2"}, []string{}},
+			{"localhost.", []string{}, []string{"fe80::1"}},
+		},
+	},
+	{
+		singlelinehosts, // see golang.org/issue/6646
+		[]staticHostEntry{
+			{"odin.", []string{"127.0.0.2"}, []string{}},
+		},
+	},
+	{
+		ipv4hosts,
+		[]staticHostEntry{
+			{"localhost.", []string{"127.0.0.1", "127.0.0.2", "127.0.0.3"}, []string{}},
+			{"localhost.localdomain.", []string{"127.0.0.3"}, []string{}},
+		},
+	},
+	{
+		ipv6hosts,
+		[]staticHostEntry{
+			{"localhost.", []string{}, []string{"::1", "fe80::1", "fe80::2", "fe80::3"}},
+			{"localhost.localdomain.", []string{}, []string{"fe80::3"}},
+		},
+	},
+	{
+		casehosts,
+		[]staticHostEntry{
+			{"PreserveMe.", []string{"127.0.0.1"}, []string{"::1"}},
+			{"PreserveMe.local.", []string{"127.0.0.1"}, []string{"::1"}},
+		},
+	},
+}
+
+func TestLookupStaticHost(t *testing.T) {
+	for _, tt := range lookupStaticHostTests {
+		h := testHostsfile(tt.file)
+		for _, ent := range tt.ents {
+			testStaticHost(t, ent, h)
+		}
+	}
+}
+
+func testStaticHost(t *testing.T, ent staticHostEntry, h *Hostsfile) {
+	t.Helper()
+	ins := []string{ent.in, plugin.Name(ent.in).Normalize(), strings.ToLower(ent.in), strings.ToUpper(ent.in)}
+	for k, in := range ins {
+		addrsV4 := h.LookupStaticHostV4(in)
+		if len(addrsV4) != len(ent.v4) {
+			t.Fatalf("%d, lookupStaticHostV4(%s) = %v; want %v", k, in, addrsV4, ent.v4)
+		}
+		for i, v4 := range addrsV4 {
+			if v4.String() != ent.v4[i] {
+				t.Fatalf("%d, lookupStaticHostV4(%s) = %v; want %v", k, in, addrsV4, ent.v4)
+			}
+		}
+		addrsV6 := h.LookupStaticHostV6(in)
+		if len(addrsV6) != len(ent.v6) {
+			t.Fatalf("%d, lookupStaticHostV6(%s) = %v; want %v", k, in, addrsV6, ent.v6)
+		}
+		for i, v6 := range addrsV6 {
+			if v6.String() != ent.v6[i] {
+				t.Fatalf("%d, lookupStaticHostV6(%s) = %v; want %v", k, in, addrsV6, ent.v6)
+			}
+		}
+	}
+}
+
+type staticIPEntry struct {
+	in  string
+	out []string
+}
+
+var lookupStaticAddrTests = []struct {
+	file string
+	ents []staticIPEntry
+}{
+	{
+		hosts,
+		[]staticIPEntry{
+			{"255.255.255.255", []string{"broadcasthost."}},
+			{"127.0.0.2", []string{"odin."}},
+			{"127.0.0.3", []string{"odin."}},
+			{"::2", []string{"odin."}},
+			{"127.1.1.1", []string{"thor."}},
+			{"127.1.1.2", []string{"ullr.", "ullrhost."}},
+			{"fe80::1", []string{"localhost."}},
+		},
+	},
+	{
+		singlelinehosts, // see golang.org/issue/6646
+		[]staticIPEntry{
+			{"127.0.0.2", []string{"odin."}},
+		},
+	},
+	{
+		ipv4hosts, // see golang.org/issue/8996
+		[]staticIPEntry{
+			{"127.0.0.1", []string{"localhost."}},
+			{"127.0.0.2", []string{"localhost."}},
+			{"127.0.0.3", []string{"localhost.", "localhost.localdomain."}},
+		},
+	},
+	{
+		ipv6hosts, // see golang.org/issue/8996
+		[]staticIPEntry{
+			{"::1", []string{"localhost."}},
+			{"fe80::1", []string{"localhost."}},
+			{"fe80::2", []string{"localhost."}},
+			{"fe80::3", []string{"localhost.", "localhost.localdomain."}},
+		},
+	},
+	{
+		casehosts, // see golang.org/issue/12806
+		[]staticIPEntry{
+			{"127.0.0.1", []string{"PreserveMe.", "PreserveMe.local."}},
+			{"::1", []string{"PreserveMe.", "PreserveMe.local."}},
+		},
+	},
+}
+
+func TestLookupStaticAddr(t *testing.T) {
+	for _, tt := range lookupStaticAddrTests {
+		h := testHostsfile(tt.file)
+		for _, ent := range tt.ents {
+			testStaticAddr(t, ent, h)
+		}
+	}
+}
+
+func testStaticAddr(t *testing.T, ent staticIPEntry, h *Hostsfile) {
+	t.Helper()
+	hosts := h.LookupStaticAddr(ent.in)
+	for i := range ent.out {
+		ent.out[i] = plugin.Name(ent.out[i]).Normalize()
+	}
+	if !reflect.DeepEqual(hosts, ent.out) {
+		t.Errorf("%s, lookupStaticAddr(%s) = %v; want %v", h.path, ent.in, hosts, h)
+	}
+}
+
+func TestHostCacheModification(t *testing.T) {
+	// Ensure that programs can't modify the internals of the host cache.
+	// See https://github.com/golang/go/issues/14212.
+
+	h := testHostsfile(ipv4hosts)
+	ent := staticHostEntry{"localhost.", []string{"127.0.0.1", "127.0.0.2", "127.0.0.3"}, []string{}}
+	testStaticHost(t, ent, h)
+	// Modify the addresses return by lookupStaticHost.
+	addrs := h.LookupStaticHostV6(ent.in)
+	for i := range addrs {
+		addrs[i] = net.IPv4zero
+	}
+	testStaticHost(t, ent, h)
+
+	h = testHostsfile(ipv6hosts)
+	entip := staticIPEntry{"::1", []string{"localhost."}}
+	testStaticAddr(t, entip, h)
+	// Modify the hosts return by lookupStaticAddr.
+	hosts := h.LookupStaticAddr(entip.in)
+	for i := range hosts {
+		hosts[i] += "junk"
+	}
+	testStaticAddr(t, entip, h)
+}
+
+// TestLookupStaticHostReloadRace exercises concurrent A/AAAA lookups against a
+// reload that swaps h.hmap. Before the fix, LookupStaticHostV4/V6 dereferenced
+// h.hmap/h.inline as call arguments (outside the RLock), racing the swap that
+// readHosts performs under h.Lock(). Run with -race.
+func TestLookupStaticHostReloadRace(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "hosts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("127.0.0.1 example.org\n::1 example.org\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	h := &Hostsfile{
+		Origins: []string{"."},
+		hmap:    newMap(),
+		inline:  newMap(),
+		options: newOptions(),
+		path:    f.Name(),
+	}
+
+	var wg sync.WaitGroup
+
+	// Reloader: force a re-parse + h.hmap swap on every iteration.
+	wg.Go(func() {
+		for range 1000 {
+			h.Lock()
+			h.size = 0
+			h.Unlock()
+			h.readHosts()
+		}
+	})
+
+	// Readers: concurrent A/AAAA lookups.
+	for range 4 {
+		wg.Go(func() {
+			for range 1000 {
+				h.LookupStaticHostV4("example.org.")
+				h.LookupStaticHostV6("example.org.")
+			}
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestParseLineLongerThanDefaultScanBuffer(t *testing.T) {
+	// A line longer than bufio.Scanner's default 64KiB buffer must not stop
+	// the scan: the entries that follow it still have to be parsed.
+	long := strings.Repeat("a", 70*1024)
+	h := testHostsfile("127.0.0.1 before.example.org\n" +
+		"127.0.0.2 " + long + ".example.org\n" +
+		"127.0.0.3 after.example.org\n")
+
+	if addrs := h.LookupStaticHostV4("before.example.org."); len(addrs) != 1 || addrs[0].String() != "127.0.0.1" {
+		t.Errorf("LookupStaticHostV4(before.example.org.) = %v, want [127.0.0.1]", addrs)
+	}
+	if addrs := h.LookupStaticHostV4("after.example.org."); len(addrs) != 1 || addrs[0].String() != "127.0.0.3" {
+		t.Errorf("LookupStaticHostV4(after.example.org.) = %v, want [127.0.0.3]", addrs)
+	}
+}
+
+func TestParseVeryLongLine(t *testing.T) {
+	// A line of several megabytes must be parsed without an arbitrary cutoff,
+	// and must not hide the entries that follow it.
+	var sb strings.Builder
+	sb.WriteString("127.0.0.1 before.example.org\n")
+	sb.WriteString("127.0.0.2")
+	const names = 200000
+	for i := range names {
+		fmt.Fprintf(&sb, " n%d.example.org", i)
+	}
+	sb.WriteString("\n127.0.0.3 after.example.org\n")
+	if sb.Len() < 3<<20 {
+		t.Fatalf("test line is %d bytes, want at least 3 MiB", sb.Len())
+	}
+	h := testHostsfile(sb.String())
+
+	for _, tc := range []struct {
+		name string
+		addr string
+	}{
+		{"before.example.org.", "127.0.0.1"},
+		{"n0.example.org.", "127.0.0.2"},
+		{"n199999.example.org.", "127.0.0.2"},
+		{"after.example.org.", "127.0.0.3"},
+	} {
+		if addrs := h.LookupStaticHostV4(tc.name); len(addrs) != 1 || addrs[0].String() != tc.addr {
+			t.Errorf("LookupStaticHostV4(%s) = %v, want [%s]", tc.name, addrs, tc.addr)
+		}
+	}
+}
+
+func TestParseLongFieldSpanningReads(t *testing.T) {
+	// A single field longer than the read buffer is not a usable name, but it
+	// must not corrupt the fields around it or the rest of the file.
+	long := strings.Repeat("a", 5<<20)
+	h := testHostsfile("127.0.0.1 before.example.org\n" +
+		"127.0.0.2 " + long + ".example.org one.example.org\n" +
+		"127.0.0.3 after.example.org\n")
+
+	for _, tc := range []struct {
+		name string
+		addr string
+	}{
+		{"before.example.org.", "127.0.0.1"},
+		{"one.example.org.", "127.0.0.2"},
+		{"after.example.org.", "127.0.0.3"},
+	} {
+		if addrs := h.LookupStaticHostV4(tc.name); len(addrs) != 1 || addrs[0].String() != tc.addr {
+			t.Errorf("LookupStaticHostV4(%s) = %v, want [%s]", tc.name, addrs, tc.addr)
+		}
+	}
+}
+
+func TestParseNoTrailingNewline(t *testing.T) {
+	h := testHostsfile("127.0.0.1 first.example.org\n127.0.0.2 last.example.org")
+
+	if addrs := h.LookupStaticHostV4("last.example.org."); len(addrs) != 1 || addrs[0].String() != "127.0.0.2" {
+		t.Errorf("LookupStaticHostV4(last.example.org.) = %v, want [127.0.0.2]", addrs)
+	}
+}
+
+func TestParseLongLineWithComment(t *testing.T) {
+	// A comment that starts beyond the read buffer must still be discarded,
+	// and must not swallow the following line.
+	long := strings.Repeat(" padding.invalid", 1<<16)
+	h := testHostsfile("127.0.0.1 one.example.org" + long + " # two.example.org\n" +
+		"127.0.0.3 after.example.org\n")
+
+	if addrs := h.LookupStaticHostV4("one.example.org."); len(addrs) != 1 || addrs[0].String() != "127.0.0.1" {
+		t.Errorf("LookupStaticHostV4(one.example.org.) = %v, want [127.0.0.1]", addrs)
+	}
+	if addrs := h.LookupStaticHostV4("two.example.org."); len(addrs) != 0 {
+		t.Errorf("LookupStaticHostV4(two.example.org.) = %v, want []", addrs)
+	}
+	if addrs := h.LookupStaticHostV4("after.example.org."); len(addrs) != 1 || addrs[0].String() != "127.0.0.3" {
+		t.Errorf("LookupStaticHostV4(after.example.org.) = %v, want [127.0.0.3]", addrs)
+	}
+}
+
+func TestParseLogsOversizedField(t *testing.T) {
+	// #8496 established that a hosts file entry must never be dropped without a
+	// trace: "the hosts file simply looked shorter than it is, with nothing in
+	// the log". A field over maxFieldSize is dropped, and when it is the address
+	// the whole line goes with it, so both cases have to be reported.
+	var logBuf bytes.Buffer
+	golog.SetOutput(&logBuf)
+	defer golog.SetOutput(io.Discard)
+
+	long := strings.Repeat("a", maxFieldSize+1)
+	h := &Hostsfile{
+		Origins: []string{"."},
+		hmap:    newMap(),
+		inline:  newMap(),
+		options: newOptions(),
+		path:    "/tmp/hosts.test",
+	}
+	h.hmap = h.parse(strings.NewReader(
+		"127.0.0.1 before.example.org\n" +
+			"127.0.0.2 " + long + ".example.org\n" +
+			long + " orphan.example.org\n" +
+			"127.0.0.4 after.example.org\n"))
+
+	// Controls: the entries around the dropped fields are still parsed.
+	for _, tc := range []struct{ name, addr string }{
+		{"before.example.org.", "127.0.0.1"},
+		{"after.example.org.", "127.0.0.4"},
+	} {
+		if addrs := h.LookupStaticHostV4(tc.name); len(addrs) != 1 || addrs[0].String() != tc.addr {
+			t.Errorf("LookupStaticHostV4(%s) = %v, want [%s]", tc.name, addrs, tc.addr)
+		}
+	}
+	if addrs := h.LookupStaticHostV4("orphan.example.org."); len(addrs) != 0 {
+		t.Errorf("LookupStaticHostV4(orphan.example.org.) = %v, want []", addrs)
+	}
+
+	got := logBuf.String()
+	for _, want := range []string{
+		`[ERROR] plugin/hosts: Hosts file "/tmp/hosts.test", line 2:`,
+		`[ERROR] plugin/hosts: Hosts file "/tmp/hosts.test", line 3:`,
+		"dropping the line",
+		"dropping the name",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Expected log to contain %q, got %q", want, got)
+		}
+	}
+	// One report per dropped field, not one per read: the field on line 3 is
+	// assembled across several calls to append.
+	if n := strings.Count(got, "[ERROR] plugin/hosts:"); n != 2 {
+		t.Errorf("Expected exactly 2 reports, got %d in %q", n, got)
+	}
+}
+
+func TestParseLogsOversizedFieldSpanningReads(t *testing.T) {
+	// The line number must survive a field that crosses the read buffer: feed
+	// runs once per chunk, but only the last chunk of a line ends it. A field
+	// this long is also reported once, not once per read.
+	var logBuf bytes.Buffer
+	golog.SetOutput(&logBuf)
+	defer golog.SetOutput(io.Discard)
+
+	long := strings.Repeat("a", 5<<20)
+	h := &Hostsfile{
+		Origins: []string{"."},
+		hmap:    newMap(),
+		inline:  newMap(),
+		options: newOptions(),
+		path:    "/tmp/hosts.test",
+	}
+	h.hmap = h.parse(strings.NewReader(
+		"127.0.0.1 before.example.org\n" +
+			"127.0.0.2 " + long + ".example.org one.example.org\n" +
+			"127.0.0.3 after.example.org\n"))
+
+	for _, tc := range []struct{ name, addr string }{
+		{"one.example.org.", "127.0.0.2"},
+		{"after.example.org.", "127.0.0.3"},
+	} {
+		if addrs := h.LookupStaticHostV4(tc.name); len(addrs) != 1 || addrs[0].String() != tc.addr {
+			t.Errorf("LookupStaticHostV4(%s) = %v, want [%s]", tc.name, addrs, tc.addr)
+		}
+	}
+
+	got := logBuf.String()
+	if want := fmt.Sprintf("line 2: name longer than %d bytes", maxFieldSize); !strings.Contains(got, want) {
+		t.Errorf("Expected log to contain %q, got %q", want, got)
+	}
+	if n := strings.Count(got, "[ERROR] plugin/hosts:"); n != 1 {
+		t.Errorf("Expected exactly 1 report, got %d in %q", n, got)
+	}
+}
+
+func TestInitInlineReportsItsOwnSource(t *testing.T) {
+	// Inline entries are parsed with the same parser but do not come from the
+	// hosts file, so naming the file in a diagnostic would send the operator to
+	// the wrong place, at a line number that does not exist there.
+	var logBuf bytes.Buffer
+	golog.SetOutput(&logBuf)
+	defer golog.SetOutput(io.Discard)
+
+	h := &Hostsfile{
+		Origins: []string{"."},
+		hmap:    newMap(),
+		inline:  newMap(),
+		options: newOptions(),
+		path:    "/tmp/hosts.test",
+	}
+	h.initInline([]string{
+		"127.0.0.1 first.example.org",
+		strings.Repeat("a", maxFieldSize+1) + " orphan.example.org",
+	})
+
+	if addrs := h.inline.name4["first.example.org."]; len(addrs) != 1 {
+		t.Errorf("inline name4[first.example.org.] = %v, want one address", addrs)
+	}
+
+	got := logBuf.String()
+	if want := "Inline hosts entries, line 2: address longer"; !strings.Contains(got, want) {
+		t.Errorf("Expected log to contain %q, got %q", want, got)
+	}
+	if strings.Contains(got, "/tmp/hosts.test") {
+		t.Errorf("Inline entries reported as coming from the hosts file: %q", got)
+	}
+}

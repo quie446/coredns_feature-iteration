@@ -1,0 +1,302 @@
+package loadbalance
+
+import (
+	"context"
+	"testing"
+
+	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/dnstest"
+	"github.com/coredns/coredns/plugin/test"
+
+	"github.com/miekg/dns"
+)
+
+func TestLoadBalanceRandom(t *testing.T) {
+	rm := LoadBalance{Next: handler(), shuffle: randomShuffle}
+
+	// the first X records must be cnames after this test
+	tests := []struct {
+		answer        []dns.RR
+		extra         []dns.RR
+		cnameAnswer   int
+		cnameExtra    int
+		addressAnswer int
+		addressExtra  int
+		mxAnswer      int
+		mxExtra       int
+	}{
+		{
+			answer: []dns.RR{
+				test.CNAME("cname1.region2.skydns.test.	300	IN	CNAME		cname2.region2.skydns.test."),
+				test.CNAME("cname2.region2.skydns.test.	300	IN	CNAME		cname3.region2.skydns.test."),
+				test.CNAME("cname5.region2.skydns.test.	300	IN	CNAME		cname6.region2.skydns.test."),
+				test.CNAME("cname6.region2.skydns.test.	300	IN	CNAME		endpoint.region2.skydns.test."),
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.1"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx1.region2.skydns.test."),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		2	mx2.region2.skydns.test."),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		3	mx3.region2.skydns.test."),
+			},
+			cnameAnswer:   4,
+			addressAnswer: 1,
+			mxAnswer:      3,
+		},
+		{
+			answer: []dns.RR{
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.1"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx1.region2.skydns.test."),
+				test.CNAME("cname.region2.skydns.test.	300	IN	CNAME		endpoint.region2.skydns.test."),
+			},
+			cnameAnswer:   1,
+			addressAnswer: 1,
+			mxAnswer:      1,
+		},
+		{
+			answer: []dns.RR{
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx1.region2.skydns.test."),
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.1"),
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.2"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx2.region2.skydns.test."),
+				test.CNAME("cname2.region2.skydns.test.	300	IN	CNAME		cname3.region2.skydns.test."),
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.3"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx3.region2.skydns.test."),
+			},
+			extra: []dns.RR{
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.1"),
+				test.AAAA("endpoint.region2.skydns.test.	300	IN	AAAA		::1"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx1.region2.skydns.test."),
+				test.CNAME("cname2.region2.skydns.test.	300	IN	CNAME		cname3.region2.skydns.test."),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx2.region2.skydns.test."),
+				test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.3"),
+				test.AAAA("endpoint.region2.skydns.test.	300	IN	AAAA		::2"),
+				test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx3.region2.skydns.test."),
+			},
+			cnameAnswer:   1,
+			cnameExtra:    1,
+			addressAnswer: 3,
+			addressExtra:  4,
+			mxAnswer:      3,
+			mxExtra:       3,
+		},
+	}
+
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+
+	for i, test := range tests {
+		req := new(dns.Msg)
+		req.SetQuestion("region2.skydns.test.", dns.TypeSRV)
+		req.Answer = test.answer
+		req.Extra = test.extra
+
+		_, err := rm.ServeDNS(context.TODO(), rec, req)
+		if err != nil {
+			t.Errorf("Test %d: Expected no error, but got %s", i, err)
+			continue
+		}
+
+		cname, address, mx, sorted := countRecords(rec.Msg.Answer)
+		if !sorted {
+			t.Errorf("Test %d: Expected CNAMEs, then AAAAs, then MX in Answer, but got mixed", i)
+		}
+		if cname != test.cnameAnswer {
+			t.Errorf("Test %d: Expected %d CNAMEs in Answer, but got %d", i, test.cnameAnswer, cname)
+		}
+		if address != test.addressAnswer {
+			t.Errorf("Test %d: Expected %d A/AAAAs in Answer, but got %d", i, test.addressAnswer, address)
+		}
+		if mx != test.mxAnswer {
+			t.Errorf("Test %d: Expected %d MXs in Answer, but got %d", i, test.mxAnswer, mx)
+		}
+
+		cname, address, mx, sorted = countRecords(rec.Msg.Extra)
+		if !sorted {
+			t.Errorf("Test %d: Expected CNAMEs, then AAAAs, then MX in Extra, but got mixed", i)
+		}
+		if cname != test.cnameExtra {
+			t.Errorf("Test %d: Expected %d CNAMEs in Extra, but got %d", i, test.cnameAnswer, cname)
+		}
+		if address != test.addressExtra {
+			t.Errorf("Test %d: Expected %d A/AAAAs in Extra, but got %d", i, test.addressAnswer, address)
+		}
+		if mx != test.mxExtra {
+			t.Errorf("Test %d: Expected %d MXs in Extra, but got %d", i, test.mxAnswer, mx)
+		}
+	}
+}
+
+func TestLoadBalanceXFR(t *testing.T) {
+	rm := LoadBalance{Next: handler()}
+
+	answer := []dns.RR{
+		test.SOA("skydns.test.	30	IN	SOA	ns.dns.skydns.test. hostmaster.skydns.test. 1542756695 7200 1800 86400 30"),
+		test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx1.region2.skydns.test."),
+		test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.1"),
+		test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.2"),
+		test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx2.region2.skydns.test."),
+		test.CNAME("cname2.region2.skydns.test.	300	IN	CNAME		cname3.region2.skydns.test."),
+		test.A("endpoint.region2.skydns.test.		300	IN	A			10.240.0.3"),
+		test.MX("mx.region2.skydns.test.			300	IN	MX		1	mx3.region2.skydns.test."),
+		test.SOA("skydns.test.	30	IN	SOA	ns.dns.skydns.test. hostmaster.skydns.test. 1542756695 7200 1800 86400 30"),
+	}
+
+	for _, xfrtype := range []uint16{dns.TypeIXFR, dns.TypeAXFR} {
+		rec := dnstest.NewRecorder(&test.ResponseWriter{})
+		req := new(dns.Msg)
+		req.SetQuestion("skydns.test.", xfrtype)
+		req.Answer = answer
+		_, err := rm.ServeDNS(context.TODO(), rec, req)
+		if err != nil {
+			t.Errorf("Expected no error, but got %s for %s", err, dns.TypeToString[xfrtype])
+			continue
+		}
+
+		if rec.Msg.Answer[0].Header().Rrtype != dns.TypeSOA {
+			t.Errorf("Expected SOA record for first answer for %s", dns.TypeToString[xfrtype])
+		}
+
+		if rec.Msg.Answer[len(rec.Msg.Answer)-1].Header().Rrtype != dns.TypeSOA {
+			t.Errorf("Expected SOA record for last answer for %s", dns.TypeToString[xfrtype])
+		}
+	}
+}
+
+func countRecords(result []dns.RR) (cname int, address int, mx int, sorted bool) {
+	const (
+		Start = iota
+		CNAMERecords
+		ARecords
+		MXRecords
+		Any
+	)
+
+	// The order of the records is used to determine if the round-robin actually did anything.
+	sorted = true
+	cname = 0
+	address = 0
+	mx = 0
+	state := Start
+	for _, r := range result {
+		switch r.Header().Rrtype {
+		case dns.TypeCNAME:
+			sorted = sorted && state <= CNAMERecords
+			state = CNAMERecords
+			cname++
+		case dns.TypeA, dns.TypeAAAA:
+			sorted = sorted && state <= ARecords
+			state = ARecords
+			address++
+		case dns.TypeMX:
+			sorted = sorted && state <= MXRecords
+			state = MXRecords
+			mx++
+		default:
+			state = Any
+		}
+	}
+	return cname, address, mx, sorted
+}
+
+func handler() plugin.Handler {
+	return plugin.HandlerFunc(func(_ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+		w.WriteMsg(r)
+		return dns.RcodeSuccess, nil
+	})
+}
+
+func BenchmarkRoundRobin(b *testing.B) {
+	answer := []dns.RR{
+		test.A("a.example.org. 300 IN A 10.0.0.1"),
+		test.A("a.example.org. 300 IN A 10.0.0.2"),
+		test.A("a.example.org. 300 IN A 10.0.0.3"),
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = roundRobin(answer)
+	}
+}
+
+// TestRoundRobinDoesNotMutateInput guards the contract that roundRobin leaves its
+// input alone. Backends may return a slice they own - plugin/file answers directly
+// out of the zone tree - so shuffling in place would corrupt shared state and race
+// with concurrent queries.
+func TestRoundRobinDoesNotMutateInput(t *testing.T) {
+	inputs := map[string][]dns.RR{
+		"addresses only": {
+			test.A("a.example.org. 300 IN A 10.0.0.1"),
+			test.A("a.example.org. 300 IN A 10.0.0.2"),
+			test.A("a.example.org. 300 IN A 10.0.0.3"),
+			test.A("a.example.org. 300 IN A 10.0.0.4"),
+		},
+		"mixed": {
+			test.CNAME("a.example.org. 300 IN CNAME b.example.org."),
+			test.A("b.example.org. 300 IN A 10.0.0.1"),
+			test.A("b.example.org. 300 IN A 10.0.0.2"),
+			test.MX("example.org. 300 IN MX 10 mx.example.org."),
+		},
+	}
+
+	for name, in := range inputs {
+		before := make([]dns.RR, len(in))
+		copy(before, in)
+
+		// Shuffle repeatedly: a single call may leave the order untouched by chance.
+		for range 50 {
+			out := roundRobin(in)
+			if len(out) != len(in) {
+				t.Fatalf("%s: got %d records back, want %d", name, len(out), len(in))
+			}
+		}
+
+		for i := range in {
+			if in[i] != before[i] {
+				t.Errorf("%s: roundRobin reordered its input at index %d", name, i)
+				break
+			}
+		}
+	}
+}
+
+func TestLoadBalanceWriteMsgNilResponse(t *testing.T) {
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	lw := &LoadBalanceResponseWriter{ResponseWriter: rec, shuffle: randomShuffle}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("WriteMsg panicked on a nil response: %v", r)
+		}
+	}()
+
+	if err := lw.WriteMsg(nil); err == nil {
+		t.Error("WriteMsg on a nil response: got nil error, want an error")
+	}
+}
+
+func TestLoadBalanceWriteMsgEmptyQuestion(t *testing.T) {
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	lw := &LoadBalanceResponseWriter{ResponseWriter: rec, shuffle: randomShuffle}
+
+	// A plugin further down the chain can hand back NOERROR with no question
+	// section at all. See #6051.
+	res := new(dns.Msg)
+	res.Response = true
+	res.Rcode = dns.RcodeSuccess
+	res.Answer = []dns.RR{
+		test.A("endpoint.example.org. 300 IN A 10.240.0.1"),
+		test.A("endpoint.example.org. 300 IN A 10.240.0.2"),
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("WriteMsg panicked on a response with an empty question section: %v", r)
+		}
+	}()
+
+	if err := lw.WriteMsg(res); err != nil {
+		t.Errorf("WriteMsg on a response with an empty question section: got error %v, want nil", err)
+	}
+	if rec.Msg == nil {
+		t.Fatal("WriteMsg did not pass the response on to the client")
+	}
+	if got := len(rec.Msg.Answer); got != 2 {
+		t.Errorf("answer section has %d records, want 2", got)
+	}
+}

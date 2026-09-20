@@ -1,0 +1,128 @@
+package loadbalance
+
+import (
+	"fmt"
+
+	"github.com/miekg/dns"
+)
+
+const (
+	ramdomShufflePolicy      = "round_robin"
+	weightedRoundRobinPolicy = "weighted"
+)
+
+// LoadBalanceResponseWriter is a response writer that shuffles A, AAAA and MX records.
+type LoadBalanceResponseWriter struct {
+	dns.ResponseWriter
+	shuffle func(*dns.Msg) *dns.Msg
+}
+
+// WriteMsg implements the dns.ResponseWriter interface.
+func (r *LoadBalanceResponseWriter) WriteMsg(res *dns.Msg) error {
+	if res == nil {
+		return fmt.Errorf("loadbalance: response message is nil")
+	}
+
+	if res.Rcode != dns.RcodeSuccess {
+		return r.ResponseWriter.WriteMsg(res)
+	}
+
+	// A response can arrive with no question section at all, in which case
+	// there is nothing to key the shuffle on and Question[0] below would
+	// panic. Pass it through untouched, as the transfer types do.
+	if len(res.Question) == 0 {
+		return r.ResponseWriter.WriteMsg(res)
+	}
+
+	if res.Question[0].Qtype == dns.TypeAXFR || res.Question[0].Qtype == dns.TypeIXFR {
+		return r.ResponseWriter.WriteMsg(res)
+	}
+
+	return r.ResponseWriter.WriteMsg(r.shuffle(res))
+}
+
+func randomShuffle(res *dns.Msg) *dns.Msg {
+	res.Answer = roundRobin(res.Answer)
+	res.Ns = roundRobin(res.Ns)
+	res.Extra = roundRobin(res.Extra)
+	return res
+}
+
+func roundRobin(in []dns.RR) []dns.RR {
+	if len(in) <= 1 {
+		return in
+	}
+
+	// A response that is only addresses - the common case - needs shuffling but no
+	// partitioning, so it can be served with a single copy instead of four slices.
+	// The copy is not optional: in must not be modified, because a backend may hand
+	// us a slice it owns. plugin/file, for example, answers straight out of the zone
+	// tree, so shuffling in place would reorder the zone itself for every other
+	// query racing with this one.
+	if t := in[0].Header().Rrtype; t == dns.TypeA || t == dns.TypeAAAA {
+		allSame := true
+		for _, r := range in[1:] {
+			if r.Header().Rrtype != t {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			out := make([]dns.RR, len(in))
+			copy(out, in)
+			roundRobinShuffle(out)
+			return out
+		}
+	}
+
+	cname := []dns.RR{}
+	address := []dns.RR{}
+	mx := []dns.RR{}
+	rest := []dns.RR{}
+	for _, r := range in {
+		switch r.Header().Rrtype {
+		case dns.TypeCNAME:
+			cname = append(cname, r)
+		case dns.TypeA, dns.TypeAAAA:
+			address = append(address, r)
+		case dns.TypeMX:
+			mx = append(mx, r)
+		default:
+			rest = append(rest, r)
+		}
+	}
+
+	roundRobinShuffle(address)
+	roundRobinShuffle(mx)
+
+	out := append(cname, rest...)
+	out = append(out, address...)
+	out = append(out, mx...)
+	return out
+}
+
+func roundRobinShuffle(records []dns.RR) {
+	switch l := len(records); l {
+	case 0, 1:
+	case 2:
+		if dns.Id()%2 == 0 {
+			records[0], records[1] = records[1], records[0]
+		}
+	default:
+		for j := range l {
+			p := j + (int(dns.Id()) % (l - j))
+			if j == p {
+				continue
+			}
+			records[j], records[p] = records[p], records[j]
+		}
+	}
+}
+
+// Write implements the dns.ResponseWriter interface.
+func (r *LoadBalanceResponseWriter) Write(buf []byte) (int, error) {
+	// Should we pack and unpack here to fiddle with the packet... Not likely.
+	log.Warning("LoadBalance called with Write: not shuffling records")
+	n, err := r.ResponseWriter.Write(buf)
+	return n, err
+}

@@ -1,0 +1,57 @@
+package health
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+	"time"
+)
+
+func Test_health_overloaded_cancellation(t *testing.T) {
+	started := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		time.Sleep(1 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	h := &health{
+		Addr: ts.URL,
+		stop: cancel,
+	}
+
+	var err error
+	h.healthURI, err = url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.healthURI.Path = "/health"
+
+	stopped := make(chan struct{})
+	go func() {
+		h.overloaded(ctx)
+		stopped <- struct{}{}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overloaded function did not start")
+	}
+
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("overloaded function should have been cancelled")
+	}
+}

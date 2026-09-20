@@ -1,0 +1,545 @@
+package file
+
+import (
+	"context"
+
+	"github.com/coredns/coredns/core/dnsserver"
+	"github.com/coredns/coredns/plugin/file/rrutil"
+	"github.com/coredns/coredns/plugin/file/tree"
+	"github.com/coredns/coredns/plugin/metadata"
+	"github.com/coredns/coredns/request"
+
+	"github.com/miekg/dns"
+)
+
+// Result is the result of a Lookup
+type Result int
+
+const (
+	// Success is a successful lookup.
+	Success Result = iota
+	// NameError indicates a nameerror
+	NameError
+	// Delegation indicates the lookup resulted in a delegation.
+	Delegation
+	// NoData indicates the lookup resulted in a NODATA.
+	NoData
+	// ServerFailure indicates a server failure during the lookup.
+	ServerFailure
+)
+
+// Lookup looks up qname and qtype in the zone. When do is true DNSSEC records are included.
+// Three sets of records are returned, one for the answer, one for authority  and one for the additional section.
+func (z *Zone) Lookup(ctx context.Context, state request.Request, qname string) ([]dns.RR, []dns.RR, []dns.RR, Result) {
+	qtype := state.QType()
+	do := state.Do()
+
+	// If z is a secondary zone we might not have transferred it, meaning we have
+	// all zone context setup, except the actual record. This means (for one thing) the apex
+	// is empty and we don't have a SOA record.
+	ap, tr := z.snapshot()
+	if ap.SOA == nil {
+		return nil, nil, nil, ServerFailure
+	}
+
+	if qname == z.origin {
+		switch qtype {
+		case dns.TypeSOA:
+			return ap.soa(do), ap.ns(do), nil, Success
+		case dns.TypeNS:
+			nsrrs := ap.ns(do)
+			glue := tr.Glue(nsrrs, do) // technically this isn't glue
+			return nsrrs, nil, glue, Success
+		}
+	}
+
+	var (
+		found, shot     bool
+		parts, wildName string
+		i               int
+		elem, wildElem  *tree.Elem
+	)
+
+	loop, _ := ctx.Value(dnsserver.LoopKey{}).(int)
+	if loop > 8 {
+		// We're back here for the 9th time; we have a loop and need to bail out.
+		// Note the answer we're returning will be incomplete (more cnames to be followed) or
+		// illegal (wildcard cname with multiple identical records). For now it's more important
+		// to protect ourselves then to give the client a valid answer. We return with an error
+		// to let the server handle what to do.
+		return nil, nil, nil, ServerFailure
+	}
+
+	// Lookup:
+	// * Per label from the right, look if it exists. We do this to find potential
+	//   delegation records.
+	// * If the per-label search finds nothing, we will look for the wildcard at the
+	//   level. If found we keep it around. If we don't find the complete name we will
+	//   use the wildcard.
+	//
+	// Main for-loop handles delegation and finding or not finding the qname.
+	// If found we check if it is a CNAME/DNAME and do CNAME processing
+	// We also check if we have type and do a nodata response.
+	//
+	// If not found, we check the potential wildcard, and use that for further processing.
+	// If not found and no wildcard we will process this as an NXDOMAIN response.
+	for {
+		parts, shot = z.nameFromRight(qname, i)
+		// We overshot the name, break and check if we previously found something.
+		if shot {
+			break
+		}
+
+		elem, found = tr.Search(parts)
+		if !found {
+			// Apex will always be found, when we are here we can search for a wildcard
+			// and save the result of that search. So when nothing match, but we have a
+			// wildcard we should expand the wildcard.
+
+			wildcard := replaceWithAsteriskLabel(parts)
+			if wild, found := tr.Search(wildcard); found {
+				wildElem = wild
+				wildName = wild.Name()
+			} else if hasDescendant(tr, wildcard) {
+				// A wildcard domain may exist as an empty non-terminal.
+				wildElem = nil
+				wildName = wildcard
+			}
+
+			// Keep on searching, because maybe we hit an empty-non-terminal (which aren't
+			// stored in the tree. Only when we have match the full qname (and possible wildcard
+			// we can be confident that we didn't find anything.
+			i++
+			continue
+		}
+
+		// If we see DNAME records, we should return those.
+		if dnamerrs := elem.Type(dns.TypeDNAME); dnamerrs != nil {
+			// Only one DNAME is allowed per name. We just pick the first one to synthesize from.
+			dname := dnamerrs[0]
+			if cname := synthesizeCNAME(state.Name(), dname.(*dns.DNAME)); cname != nil {
+				// A DNAME substitution that does not change the name can only loop.
+				if dns.CanonicalName(cname.Hdr.Name) == dns.CanonicalName(cname.Target) {
+					return nil, nil, nil, ServerFailure
+				}
+
+				var (
+					answer, ns, extra []dns.RR
+					rcode             Result
+				)
+
+				// We don't need to chase CNAME chain for synthesized CNAME
+				if qtype == dns.TypeCNAME {
+					answer = []dns.RR{cname}
+					ns = ap.ns(do)
+					extra = nil
+					rcode = Success
+				} else {
+					ctx = context.WithValue(ctx, dnsserver.LoopKey{}, loop+1)
+					answer, ns, extra, rcode = z.externalLookup(ctx, state, tr, elem, []dns.RR{cname})
+				}
+
+				if do {
+					sigs := elem.Type(dns.TypeRRSIG)
+					sigs = rrutil.SubTypeSignature(sigs, dns.TypeDNAME)
+					dnamerrs = append(dnamerrs, sigs...)
+				}
+
+				// The relevant DNAME RR should be included in the answer section,
+				// if the DNAME is being employed as a substitution instruction.
+				answer = append(dnamerrs, answer...)
+
+				return answer, ns, extra, rcode
+			}
+			// The domain name that owns a DNAME record is allowed to have other RR types
+			// at that domain name, except those have restrictions on what they can coexist
+			// with (e.g. another DNAME). So there is nothing special left here.
+		}
+
+		// If we see NS records, it means the name has been delegated.
+		if nsrrs, glue, ok := delegationFromElem(tr, elem, qname, qtype, do); ok {
+			return nil, nsrrs, glue, Delegation
+		}
+
+		i++
+	}
+
+	// Found entire name.
+	if found && shot {
+		if rrs := elem.Type(dns.TypeCNAME); len(rrs) > 0 && qtype != dns.TypeCNAME {
+			ctx = context.WithValue(ctx, dnsserver.LoopKey{}, loop+1)
+			return z.externalLookup(ctx, state, tr, elem, rrs)
+		}
+
+		rrs := elem.Type(qtype)
+
+		// NODATA
+		if len(rrs) == 0 {
+			ret := ap.soa(do)
+			if do {
+				nsec := typeFromElem(elem, dns.TypeNSEC, do)
+				ret = append(ret, nsec...)
+			}
+			return nil, ret, nil, NoData
+		}
+
+		// Additional section processing for MX, SRV. Check response and see if any of the names are in bailiwick -
+		// if so add IP addresses to the additional section.
+		additional := z.additionalProcessing(rrs, do)
+
+		if do {
+			sigs := elem.Type(dns.TypeRRSIG)
+			sigs = rrutil.SubTypeSignature(sigs, qtype)
+			rrs = append(rrs, sigs...)
+		}
+
+		return rrs, ap.ns(do), additional, Success
+	}
+
+	// Haven't found the original name.
+
+	// Found a wildcard source of synthesis. It may be an empty non-terminal.
+	if wildName != "" && !closerENTExists(tr, qname, wildName) {
+		if wildElem == nil {
+			return nil, ap.soa(do), nil, NoData
+		}
+
+		// set metadata value for the wildcard record that synthesized the result
+		metadata.SetValueFunc(ctx, "zone/wildcard", func() string {
+			return wildElem.Name()
+		})
+
+		if rrs := wildElem.TypeForWildcard(dns.TypeCNAME, qname); len(rrs) > 0 && qtype != dns.TypeCNAME {
+			ctx = context.WithValue(ctx, dnsserver.LoopKey{}, loop+1)
+			return z.externalLookup(ctx, state, tr, wildElem, rrs)
+		}
+
+		rrs := wildElem.TypeForWildcard(qtype, qname)
+
+		// NODATA response.
+		if len(rrs) == 0 {
+			ret := ap.soa(do)
+			if do {
+				nsec := typeFromElem(wildElem, dns.TypeNSEC, do)
+				ret = append(ret, nsec...)
+			}
+			return nil, ret, nil, NoData
+		}
+
+		// Additional section processing for MX, SRV, SVCB, HTTPS. Check response
+		// and see if any of the names are in bailiwick - if so add IP addresses
+		// to the additional section. This mirrors the non-wildcard path above.
+		additional := z.additionalProcessing(rrs, do)
+
+		auth := ap.ns(do)
+		if do {
+			// An NSEC is needed to say no longer name exists under this wildcard.
+			if deny, found := tr.Prev(qname); found {
+				nsec := typeFromElem(deny, dns.TypeNSEC, do)
+				auth = append(auth, nsec...)
+			}
+
+			sigs := wildElem.TypeForWildcard(dns.TypeRRSIG, qname)
+			sigs = rrutil.SubTypeSignature(sigs, qtype)
+			rrs = append(rrs, sigs...)
+		}
+		return rrs, auth, additional, Success
+	}
+
+	rcode := NameError
+
+	// Hacky way to get around empty-non-terminals. If a longer name does exist, but this qname, does not, it
+	// must be an empty-non-terminal. If so, we do the proper NXDOMAIN handling, but set the rcode to be success.
+	if hasDescendant(tr, qname) {
+		rcode = Success
+	}
+
+	ret := ap.soa(do)
+	if do {
+		deny, found := tr.Prev(qname)
+		if !found {
+			goto Out
+		}
+		nsec := typeFromElem(deny, dns.TypeNSEC, do)
+		ret = append(ret, nsec...)
+
+		if rcode != NameError {
+			goto Out
+		}
+
+		ce, found := z.ClosestEncloser(qname)
+
+		// wildcard denial only for NXDOMAIN
+		if found {
+			// wildcard denial
+			wildcard := "*." + ce.Name()
+			if ss, found := tr.Prev(wildcard); found {
+				// Only add this nsec if it is different than the one already added
+				if ss.Name() != deny.Name() {
+					nsec := typeFromElem(ss, dns.TypeNSEC, do)
+					ret = append(ret, nsec...)
+				}
+			}
+		}
+	}
+Out:
+	return nil, ret, nil, rcode
+}
+
+// closerENTExists reports whether there is an empty-non-terminal between the
+// wildcard's parent and qname. Per RFC 4592, such an ENT is the closest
+// encloser and the shallower wildcard does not apply to qname.
+func closerENTExists(tr *tree.Tree, qname, wildcardName string) bool {
+	// The wildcard owner is "*.<parent>"; anything with that exact prefix is not a closer encloser.
+	if len(wildcardName) < 2 || wildcardName[0] != '*' || wildcardName[1] != '.' {
+		return false
+	}
+	parent := wildcardName[2:]
+	// Walk strict ancestors of qname that are strict descendants of parent.
+	// Each ancestor is an ENT if the tree contains any name strictly below it.
+	name := qname
+	offset, end := dns.NextLabel(name, 0)
+	for !end {
+		name = name[offset:]
+		if name == parent || !dns.IsSubDomain(parent, name) {
+			return false
+		}
+		if hasDescendant(tr, name) {
+			return true
+		}
+		offset, end = dns.NextLabel(name, 0)
+	}
+	return false
+}
+
+// hasDescendant reports whether the tree contains a name strictly below name.
+func hasDescendant(tr *tree.Tree, name string) bool {
+	x, found := tr.Next(name)
+	return found && tree.Less(x, name) != 0 && dns.IsSubDomain(name, x.Name())
+}
+
+// typeFromElem returns the type tp from e and adds signatures (if they exist) and do is true.
+func typeFromElem(elem *tree.Elem, tp uint16, do bool) []dns.RR {
+	rrs := elem.Type(tp)
+	if do {
+		sigs := elem.Type(dns.TypeRRSIG)
+		sigs = rrutil.SubTypeSignature(sigs, tp)
+		rrs = append(rrs, sigs...)
+	}
+	return rrs
+}
+
+func (a Apex) soa(do bool) []dns.RR {
+	if do {
+		ret := append([]dns.RR{a.SOA}, a.SIGSOA...)
+		return ret
+	}
+	return []dns.RR{a.SOA}
+}
+
+func (a Apex) ns(do bool) []dns.RR {
+	if do {
+		ret := append(a.NS, a.SIGNS...)
+		return ret
+	}
+	return a.NS
+}
+
+// authority returns the records for the authority section of a response with
+// the given result: the SOA for negative answers (NXDOMAIN/NODATA), as
+// required by RFC 2308, and the NS records otherwise.
+func (z *Zone) authority(do bool, result Result) []dns.RR {
+	if result == NameError || result == NoData {
+		return z.soa(do)
+	}
+	return z.ns(do)
+}
+
+// externalLookup adds signatures and tries to resolve CNAMEs that point to
+// external names. It also runs additional-section processing on the resolved
+// answer so in-bailiwick SRV/MX/SVCB/HTTPS targets get their A/AAAA glue, like
+// the direct path.
+func (z *Zone) externalLookup(ctx context.Context, state request.Request, tr *tree.Tree, elem *tree.Elem, rrs []dns.RR) ([]dns.RR, []dns.RR, []dns.RR, Result) {
+	qtype := state.QType()
+	do := state.Do()
+
+	if do {
+		sigs := elem.Type(dns.TypeRRSIG)
+		sigs = rrutil.SubTypeSignature(sigs, dns.TypeCNAME)
+		rrs = append(rrs, sigs...)
+	}
+
+	targetName := rrs[0].(*dns.CNAME).Target
+	elem, _ = tr.Search(targetName)
+	if ns, extra, ok := z.findDelegation(tr, targetName, qtype, do, elem); ok {
+		return rrs, ns, extra, Delegation
+	}
+	if elem == nil || (qtype == dns.TypeNS || qtype == dns.TypeSOA && targetName == z.origin) {
+		lookupRRs, result := z.doLookup(ctx, state, targetName, qtype)
+		rrs = append(rrs, lookupRRs...)
+		return rrs, z.authority(do, result), z.additionalProcessing(rrs, do), result
+	}
+
+	i := 0
+
+Redo:
+	cname := elem.Type(dns.TypeCNAME)
+	if len(cname) > 0 {
+		// A CNAME that points to its own owner name can only loop.
+		if dns.CanonicalName(cname[0].Header().Name) == dns.CanonicalName(cname[0].(*dns.CNAME).Target) {
+			return nil, nil, nil, ServerFailure
+		}
+
+		rrs = append(rrs, cname...)
+
+		if do {
+			sigs := elem.Type(dns.TypeRRSIG)
+			sigs = rrutil.SubTypeSignature(sigs, dns.TypeCNAME)
+			rrs = append(rrs, sigs...)
+		}
+		targetName := cname[0].(*dns.CNAME).Target
+		elem, _ = tr.Search(targetName)
+		if ns, extra, ok := z.findDelegation(tr, targetName, qtype, do, elem); ok {
+			return rrs, ns, extra, Delegation
+		}
+		if elem == nil || (qtype == dns.TypeNS || qtype == dns.TypeSOA && targetName == z.origin) {
+			lookupRRs, result := z.doLookup(ctx, state, targetName, qtype)
+			rrs = append(rrs, lookupRRs...)
+			return rrs, z.authority(do, result), z.additionalProcessing(rrs, do), result
+		}
+
+		i++
+		if i > 8 {
+			return rrs, z.ns(do), z.additionalProcessing(rrs, do), Success
+		}
+
+		goto Redo
+	}
+
+	targets := elem.Type(qtype)
+	if len(targets) > 0 {
+		rrs = append(rrs, targets...)
+
+		if do {
+			sigs := elem.Type(dns.TypeRRSIG)
+			sigs = rrutil.SubTypeSignature(sigs, qtype)
+			rrs = append(rrs, sigs...)
+		}
+	}
+
+	return rrs, z.ns(do), z.additionalProcessing(rrs, do), Success
+}
+
+// findDelegation returns the first zone cut between the zone apex and qname.
+func (z *Zone) findDelegation(tr *tree.Tree, qname string, qtype uint16, do bool, exact *tree.Elem) (ns, extra []dns.RR, ok bool) {
+	for i := 1; ; i++ {
+		name, shot := z.nameFromRight(qname, i)
+		if shot {
+			return nil, nil, false
+		}
+		if name == qname {
+			if exact == nil {
+				return nil, nil, false
+			}
+			return delegationFromElem(tr, exact, qname, qtype, do)
+		}
+		elem, found := tr.Search(name)
+		if !found {
+			continue
+		}
+		if ns, extra, ok := delegationFromElem(tr, elem, qname, qtype, do); ok {
+			return ns, extra, true
+		}
+	}
+}
+
+// delegationFromElem builds a referral from a zone-cut element. A DS query at
+// the cut itself is answered by the parent zone instead of returning a referral.
+func delegationFromElem(tr *tree.Tree, elem *tree.Elem, qname string, qtype uint16, do bool) (ns, extra []dns.RR, ok bool) {
+	ns = elem.Type(dns.TypeNS)
+	if ns == nil || (qtype == dns.TypeDS && elem.Name() == qname) {
+		return nil, nil, false
+	}
+
+	extra = tr.Glue(ns, do)
+	if do {
+		ns = append(ns, typeFromElem(elem, dns.TypeDS, do)...)
+	}
+	return ns, extra, true
+}
+
+func (z *Zone) doLookup(ctx context.Context, state request.Request, target string, qtype uint16) ([]dns.RR, Result) {
+	m, e := z.Upstream.Lookup(ctx, state, target, qtype)
+	if e != nil {
+		return nil, ServerFailure
+	}
+	if m == nil {
+		return nil, Success
+	}
+	if m.Rcode == dns.RcodeNameError {
+		return m.Answer, NameError
+	}
+	if m.Rcode == dns.RcodeServerFailure {
+		return m.Answer, ServerFailure
+	}
+	if m.Rcode == dns.RcodeSuccess && len(m.Answer) == 0 {
+		return m.Answer, NoData
+	}
+	return m.Answer, Success
+}
+
+// additionalProcessing checks the current answer section and retrieves A or AAAA records
+// (and possible SIGs) to need to be put in the additional section. A target referenced by
+// more than one record is only resolved once.
+func (z *Zone) additionalProcessing(answer []dns.RR, do bool) (extra []dns.RR) {
+	var lookup map[string]struct{}
+
+	for _, rr := range answer {
+		name := ""
+		switch x := rr.(type) {
+		case *dns.SRV:
+			name = x.Target
+		case *dns.MX:
+			name = x.Mx
+		case *dns.SVCB:
+			name = x.Target
+		case *dns.HTTPS:
+			name = x.Target
+		}
+		if len(name) == 0 || !dns.IsSubDomain(z.origin, name) {
+			continue
+		}
+
+		// The answer can reference one target more than once, e.g. two MX records that only
+		// differ in preference. Its addresses belong in the additional section once. Compare
+		// canonically: SRV targets are not lowercased on insert (see Zone.Insert), while the
+		// zone's tree matches names case-insensitively.
+		target := dns.CanonicalName(name)
+		if _, ok := lookup[target]; ok {
+			continue
+		}
+		if lookup == nil {
+			// Allocate on first use: this runs for every answer, most of which carry no target.
+			lookup = make(map[string]struct{}, len(answer))
+		}
+		lookup[target] = struct{}{}
+
+		elem, _ := z.Search(name)
+		if elem == nil {
+			continue
+		}
+
+		sigs := elem.Type(dns.TypeRRSIG)
+		for _, addr := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			if a := elem.Type(addr); a != nil {
+				extra = append(extra, a...)
+				if do {
+					sig := rrutil.SubTypeSignature(sigs, addr)
+					extra = append(extra, sig...)
+				}
+			}
+		}
+	}
+
+	return extra
+}
