@@ -50,10 +50,10 @@ require (
 )
 
 require (
-	github.com/caddyserver/certmagic v0.25.4
+	github.com/caddyserver/certmagic v0.25.6
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/letsencrypt/pebble/v2 v2.10.1
-	github.com/mholt/acmez/v3 v3.1.6
+	github.com/mholt/acmez/v3 v3.1.7
 	github.com/pires/go-proxyproto v0.15.0
 	github.com/prometheus/exporter-toolkit v0.19.0
 	go.uber.org/zap v1.28.0
@@ -98,7 +98,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.49.0 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/caddyserver/zerossl v0.1.5 // indirect
+	github.com/caddyserver/zerossl v0.1.6 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cihub/seelog v0.0.0-20170130134532-f561c5e57575 // indirect
@@ -148,7 +148,7 @@ require (
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
-	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/letsencrypt/challtestsrv v1.4.2 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
