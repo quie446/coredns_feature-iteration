@@ -52,7 +52,7 @@ require (
 require (
 	github.com/caddyserver/certmagic v0.25.4
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/letsencrypt/pebble/v2 v2.10.1
+	github.com/letsencrypt/pebble/v2 v2.10.3
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/pires/go-proxyproto v0.15.0
 	github.com/prometheus/exporter-toolkit v0.19.0
@@ -112,7 +112,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.8 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v1.0.0 // indirect
